@@ -1,0 +1,20 @@
+Роль: Backend Tech Lead.
+
+Сформируй API спецификацию (REST) для MVP:
+Эндпоинты минимум:
+- POST /brief/normalize
+- POST /deck/generate
+- POST /deck/{id}/edit
+- GET  /deck/{id}
+- POST /deck/{id}/export
+
+Для каждого:
+- request JSON
+- response JSON
+- коды ошибок
+- идемпотентность/ретраи
+- лимиты
+
+Верни Markdown.
+SRS + Prompt Architecture:
+<<<{Загруженные doc документы}>>>

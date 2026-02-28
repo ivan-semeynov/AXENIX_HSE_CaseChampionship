@@ -1,0 +1,372 @@
+# Prompt-архитектура (часть системного дизайна)
+
+Цель prompt-архитектуры — обеспечить **воспроизводимую** генерацию брендированных академических презентаций с контролем качества, стоимости и рисков (галлюцинации/стиль/комплаенс), поддержать **частичную регенерацию** и дать **прозрачные артефакты** для разработки и аудита.
+
+---
+
+## 1) Общая схема пайплайна P0–P8
+
+**Входы пайплайна**
+
+* `raw_brief` (тема/цель/аудитория/формат/ограничения)
+* `sources[]` (текст/документы/таблицы), разрешённые для фактов
+* `tenant_brand` (brand tokens + шаблоны/макеты + правила brand-lock)
+* `context` (роль пользователя, org_unit, язык, целевой формат экспорта)
+
+**Выходы пайплайна**
+
+* `deck` (структура + слайды + speaker notes + источники/пометки NEEDS_SOURCE)
+* `visual_plan` (что рисовать/какие графики/где placeholders)
+* `render_spec` (строго структурированный JSON для Renderer)
+* `qa_report` (issues, score, что требует пользователя)
+
+**Ключевой принцип**: **LLM не является источником истины**. Любые факты/числа должны быть либо:
+
+1. извлечены из `sources`, либо
+2. помечены как `NEEDS_SOURCE`, либо
+3. вынесены в `clarifying_questions`.
+
+---
+
+## 2) Таблица "Prompt steps"
+
+| Step | Название                   | Назначение                                            | Вход                                    | Выход                      | Техника prompting                                          |
+| ---- | -------------------------- | ----------------------------------------------------- | --------------------------------------- | -------------------------- | ---------------------------------------------------------- |
+| P0   | Brief Normalizer           | Привести ввод к каноническому Brief + выявить пробелы | raw_brief, tenant_brand                 | `brief_v1`                 | Role + structured extraction (JSON), defaults as `assumed` |
+| P1   | Clarifier                  | Сформировать до 7 вопросов + дефолты                  | brief_v1                                | `clarifier_pack`           | Minimal questions, priority ordering, “default + confirm”  |
+| P2   | Storyline Planner          | 2–3 альтернативы сторилайна + выбор                   | brief_v1 (+answers)                     | `storyline_v1`             | Multi-option generation + scoring rubric (without CoT)     |
+| P3   | Slide Blueprint            | План слайдов (цель, тезисы, визуал)                   | storyline_v1, brief_v1                  | `blueprint_v1`             | Template-driven slide schema, length constraints           |
+| P4   | Copywriter & Notes         | Финальный текст + speaker notes + терминология        | blueprint_v1                            | `slides_v1` + `terms_dict` | Rewrite with constraints, consistency dictionary           |
+| P5   | Visual Planner             | План визуалов + промпты для ассетов/графиков          | slides_v1, sources                      | `visual_plan_v1`           | “Visual-first” mapping, placeholders if no data            |
+| P6   | QA & Consistency Fix       | Автопроверка + исправления + needs_input              | slides_v1, brief_v1                     | `qa_report` + `slides_v2`  | Self-critique checklist + constrained fixes                |
+| P7   | Renderer Spec Builder      | Генерация render_spec (layout + элементы + grid)      | slides_v2, visual_plan_v1, tenant_brand | `render_spec_v1`           | Strict JSON schema, layout mapping                         |
+| P8   | Targeted Regen (Edit Loop) | Частичная регенерация (per slide/block)               | deck_id, slide_context, instruction     | `slide_patch` + `qa_patch` | Retrieval of local context + minimal rewrite + diff output |
+
+---
+
+## 3) Структуры JSON по шагам (контракты)
+
+Ниже — **минимальные контракты**, которые валидируются (JSON Schema) в Orchestrator/LLM Gateway. В MVP можно хранить как файлы `/schemas/Px.schema.json`.
+
+### P0 — `brief_v1`
+
+```json
+{
+  "brief": {
+    "topic": "string",
+    "goal": "string",
+    "audience": { "who": "string", "level": "string", "pain_points": ["string"] },
+    "context": "string",
+    "key_messages": ["string"],
+    "call_to_action": "string",
+    "constraints": {
+      "slide_count": "number|null",
+      "time_minutes": "number|null",
+      "language": "string",
+      "tone": "string",
+      "must_include": ["string"],
+      "must_avoid": ["string"]
+    },
+    "brand": {
+      "template_id": "string",
+      "brand_lock_level": "strict|medium|low"
+    },
+    "data_inputs": [
+      { "type": "text|table|link|none", "description": "string", "ref": "string|null" }
+    ],
+    "assumptions": ["string"]
+  },
+  "missing_info": ["string"],
+  "clarifying_questions": ["string"],
+  "risks": ["string"]
+}
+```
+
+### P1 — `clarifier_pack`
+
+```json
+{
+  "questions": [
+    { "q": "string", "default": "string", "why_it_matters": "string", "priority": 1 }
+  ]
+}
+```
+
+### P2 — `storyline_v1`
+
+```json
+{
+  "options": [
+    {
+      "name": "string",
+      "sections": [{ "title": "string", "purpose": "string" }],
+      "flow": "string",
+      "best_for": "string",
+      "scores": {
+        "goal_fit": 0,
+        "clarity": 0,
+        "persuasion": 0,
+        "overload_risk": 0,
+        "uniqueness": 0
+      }
+    }
+  ],
+  "selected": { "name": "string", "reason": "string" }
+}
+```
+
+### P3 — `blueprint_v1`
+
+```json
+{
+  "slides": [
+    {
+      "slide_no": 1,
+      "type": "title|agenda|content|chart|case|summary|cta|section",
+      "objective": "string",
+      "title": "string",
+      "bullets": ["string"],
+      "visual": {
+        "type": "diagram|chart|table|image|icons|none",
+        "description": "string",
+        "data_binding": { "source_ref": "string", "fields": ["string"] }
+      },
+      "key_takeaway": "string"
+    }
+  ]
+}
+```
+
+### P4 — `slides_v1` + `terms_dict`
+
+```json
+{
+  "slides": [
+    {
+      "slide_no": 1,
+      "title": "string",
+      "bullets": ["string"],
+      "speaker_notes": "string",
+      "citations": [
+        { "claim": "string", "source_ref": "string|null", "status": "OK|NEEDS_SOURCE" }
+      ]
+    }
+  ],
+  "global_terms_dictionary": [
+    { "term": "string", "definition": "string", "use_consistently_as": "string" }
+  ]
+}
+```
+
+### P5 — `visual_plan_v1`
+
+```json
+{
+  "visual_plan": [
+    {
+      "slide_no": 1,
+      "visual": {
+        "type": "diagram|chart|table|image|icons|none",
+        "description": "string",
+        "image_prompt": "string|null",
+        "icon_keywords": ["string"],
+        "chart_spec": {
+          "source_ref": "string|null",
+          "chart_type": "bar|line|pie|table|none",
+          "x": "string|null",
+          "y": "string|null",
+          "series": ["string"]
+        }
+      }
+    }
+  ]
+}
+```
+
+### P6 — `qa_report` + `slides_v2`
+
+```json
+{
+  "score": { "total": 0, "by_rule": [{ "rule": "string", "score": 0, "notes": "string" }] },
+  "issues": [
+    { "severity": "low|medium|high", "slide_no": 1, "problem": "string", "fix_suggestion": "string" }
+  ],
+  "needs_user_input": [
+    { "slide_no": 1, "question": "string", "why": "string", "suggested_default": "string|null" }
+  ],
+  "fixed_slides": [
+    { "slide_no": 1, "title": "string", "bullets": ["string"], "speaker_notes": "string" }
+  ]
+}
+```
+
+### P7 — `render_spec_v1`
+
+```json
+{
+  "theme": {
+    "font_primary": "string",
+    "font_secondary": "string",
+    "palette": { "primary": "string", "secondary": "string", "accent": "string", "bg": "string", "text": "string" }
+  },
+  "deck_meta": { "tenant_id": "string", "template_id": "string", "language": "string" },
+  "slides": [
+    {
+      "slide_no": 1,
+      "layout_id": "TITLE|TITLE_BULLETS|TWO_COL|CHART|SECTION|SUMMARY",
+      "elements": [
+        { "type": "title|text|bullets|image|chart|shape", "text": "string", "items": ["string"], "asset_ref": "string|null",
+          "pos": { "x": 0, "y": 0, "w": 12, "h": 1 },
+          "style": { "role": "H1|H2|BODY|CAPTION", "locked": true }
+        }
+      ],
+      "speaker_notes": "string"
+    }
+  ]
+}
+```
+
+### P8 — `slide_patch` (для частичной регенерации)
+
+```json
+{
+  "deck_id": "string",
+  "base_version_id": "string",
+  "slide_no": 5,
+  "patch": {
+    "title": "string|null",
+    "bullets_replace": ["string"],
+    "speaker_notes": "string|null",
+    "visual_patch": { "type": "string", "description": "string" }
+  },
+  "diff_summary": "string",
+  "qa_patch": {
+    "issues": [{ "severity": "string", "problem": "string", "fix_suggestion": "string" }],
+    "score_delta": -1
+  }
+}
+```
+
+---
+
+## 4) Guardrails (качество, антигаллюцинации, стиль, длина)
+
+### 4.1 Anti-hallucination (факты/цифры)
+
+**Политика:**
+
+* Любой “claim” должен иметь `source_ref` или маркировку `NEEDS_SOURCE`.
+* Запрещено вводить числа, проценты, даты без источника.
+* Если источника нет — либо вопрос P1/P6, либо placeholder.
+
+**Техническая реализация:**
+
+* LLM Gateway валидирует наличие `citations[].status` и блокирует “OK” без `source_ref` для фактов/цифр.
+* Orchestrator может включать режим “strict_sources_only” для вузов.
+
+### 4.2 Style locks / brand-lock
+
+**Политика:**
+
+* Шрифты/палитра/логотип/макеты — locked.
+* Пользователь правит смысл и допустимые layout-опции.
+
+**Техническая реализация:**
+
+* `tenant_brand` передаётся во все шаги; P7 выставляет `style.locked=true` в render_spec.
+* UI показывает только разрешённые переключатели (layout choices).
+
+### 4.3 Length limits / readability
+
+* Буллет ≤ 12 слов (P3/P4/P6).
+* 3–5 буллетов на слайд.
+* Speaker notes 30–60 сек/слайд (ограничение по символам/словам).
+* Авто-правило: “один слайд — один takeaway”.
+
+### 4.4 Safety & privacy guardrails
+
+* PII redaction до логирования (email/телефон/паспорт и т.п.).
+* Запрет на включение конфиденциальных данных в image prompts (P5).
+
+---
+
+## 5) Human-in-the-loop точки (HITL)
+
+Минимальные точки, которые повышают качество и доверие (и хорошо смотрятся на защите):
+
+1. **После P0/P1:** подтверждение цели/аудитории/ограничений (или принятие дефолтов).
+2. **После P2:** выбор сторилайна из альтернатив (в UI — “Option A/B/C”).
+3. **Перед экспортом:** проверка high-severity issues из P6 (если есть).
+4. **Правки per slide:** пользователь задаёт конкретные инструкции, система применяет P8 и показывает diff.
+5. **Админ-контур:** утверждение брендбука/шаблонов (иначе генерация идёт в “unbranded demo mode”).
+
+---
+
+## 6) Частичная регенерация (per slide / per block)
+
+### 6.1 Принцип
+
+Не перегенерировать весь deck. Для каждого изменения формируется **локальный контекст**:
+
+* `brief_v1` (цель/аудитория/тон)
+* текущий слайд (до правки)
+* 1–2 соседних слайда (для связности)
+* `terms_dict` (чтобы не “переименовать сущности”)
+* `tenant_brand` (brand-lock)
+* `user_instruction` (что именно изменить)
+
+### 6.2 Стратегии
+
+* **Rewrite-in-place:** “перепиши буллеты короче/проще” → обновить только bullets/notes.
+* **Add slide:** вставка нового слайда → пересчитать нумерацию и обновить только outline и соседние transitions.
+* **Change visual:** заменить визуал без изменения текста → обновить P5/P7 элементы.
+
+### 6.3 Контроль дрейфа
+
+* P8 возвращает `diff_summary` и `qa_patch`; Orchestrator отклоняет patch, если:
+
+  * нарушен brand-lock,
+  * превышены лимиты длины,
+  * появились `OK` claims без source_ref.
+
+---
+
+## 7) Автоматическая оценка качества (rubric)
+
+### 7.1 Rubric (10 правил × 0/1/2 = 20)
+
+**R1. Соответствие цели brief**
+**R2. Логика потока (связность слайдов)**
+**R3. Ясность заголовков (информативность, не “общие слова”)**
+**R4. Буллеты: краткость и конкретика (≤12 слов, без воды)**
+**R5. Один takeaway на слайд**
+**R6. Термины единообразны (terms_dict)**
+**R7. Нет неистинных фактов/чисел (NEEDS_SOURCE дисциплина)**
+**R8. Визуалы уместны и поддерживают смысл**
+**R9. Brand compliance (layout/цвета/шрифты locked)**
+**R10. Экспортная пригодность (layout constraints, no overflow placeholders)**
+
+### 7.2 Как считается
+
+* P6 выдаёт `score.by_rule[]`, `issues[]`, `needs_user_input[]`.
+* Дополнительно часть правил может считаться **детерминированно** без LLM:
+
+  * длина буллетов, количество буллетов, наличие CTA, наличие NEEDS_SOURCE
+  * проверка overflow по сетке в render_spec (если доступно)
+
+### 7.3 Порог качества (gate)
+
+* Для автоперехода к P7/PDF экспорт: `total >= 14/20` и `high severity issues == 0`
+* Иначе — показать пользователю “что исправить” или применить автофиксы.
+
+---
+
+## 8) Операционные детали (для Orchestrator + LLM Gateway)
+
+* Каждый шаг = отдельная “Prompt Card” с: `prompt_id`, `prompt_version`, `input_schema`, `output_schema`, `model_policy`.
+* Все артефакты шага сохраняются в `GenerationRun` (S3 refs) для воспроизводимости и аудита.
+* LLM Gateway: маршрутизация “cheap draft” для P0/P3, “strong” для P4/P6 при необходимости; строгая валидация JSON; лимит стоимости на run.
+
+---
+
+Если хочешь, следующим шагом могу подготовить **реальные тексты промптов** (System/Developer/User) для P0–P8 под ваш домен “вуз/академический контент” + **JSON Schemas** для валидации (как отдельные блоки, готовые для репозитория).

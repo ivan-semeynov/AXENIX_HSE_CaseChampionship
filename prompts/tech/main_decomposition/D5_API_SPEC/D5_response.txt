@@ -1,0 +1,417 @@
+# REST API спецификация (MVP) — AI-сервис генерации презентаций (B2B2C)
+
+Основано на SRS и Prompt Architecture (P0–P8), включая требования к идемпотентности, ретраям, brand-lock, anti-hallucination и экспорту.
+
+---
+
+## 0) Общие положения
+
+### Base URL
+
+`/api/v1`
+
+### Аутентификация и авторизация
+
+* **Auth:** SSO (OIDC/SAML) с выдачей JWT/Session-cookie на стороне UI → Backend.
+* **RBAC:** роли `Student|Teacher|Admin|Buyer` + `org_unit` ограничения.
+
+**Заголовки**
+
+* `Authorization: Bearer <token>` (или cookie)
+* `X-Tenant-Id: <tenant_id>` (если не выводится из токена)
+* `Idempotency-Key: <uuid>` — для POST, где требуется идемпотентность
+* `X-Request-Id: <uuid>` — корреляция логов (опционально)
+
+### Ограничения и лимиты (MVP defaults)
+
+* Максимум размер sources upload через этот API: **до 10 MB** (иначе отдельный upload endpoint; в MVP можно принимать только текст/ссылки).
+* Максимум `slide_count`: **15** (по SRS экспорт до 15 слайдов). 
+* Максимум `edit` операций в минуту на пользователя: **30/min** (rate limit).
+* Лимит одновременных активных `generation_run` на пользователя: **2**.
+* Срок жизни `download_url` для экспорта: **15 минут** (signed URL).
+
+> Эти лимиты должны быть конфигурируемыми per-tenant (в реале), но для MVP фиксируем дефолты.
+
+### Ретраи (retry policy)
+
+* Клиент может повторять запросы при `429/503/504` с exponential backoff (например 1s, 2s, 4s, jitter).
+* Для **POST с Idempotency-Key** повторы безопасны: сервер должен вернуть тот же результат (или статус) для одинакового ключа в рамках TTL (например 24 часа).
+
+### Формат ошибок (единый)
+
+```json
+{
+  "error": {
+    "code": "STRING_CODE",
+    "message": "human readable",
+    "details": {"any":"json"},
+    "request_id": "uuid"
+  }
+}
+```
+
+**Типовые коды ошибок**
+
+* `400` `INVALID_REQUEST` — невалидный JSON/схема/обязательные поля
+* `401` `UNAUTHORIZED`
+* `403` `FORBIDDEN` — RBAC/org_unit
+* `404` `NOT_FOUND`
+* `409` `CONFLICT` — неверная base_version_id, конфликт версий
+* `413` `PAYLOAD_TOO_LARGE`
+* `422` `SCHEMA_VALIDATION_FAILED` — выход LLM не проходит схему/валидацию (внутренняя ошибка пайплайна)
+* `429` `RATE_LIMITED`
+* `500` `INTERNAL_ERROR`
+* `503` `LLM_UNAVAILABLE` / `RENDERER_UNAVAILABLE`
+* `504` `TIMEOUT`
+
+---
+
+## 1) POST `/brief/normalize` (P0)
+
+Нормализует сырой бриф в канонический `brief_v1` + выявляет missing_info и вопросы (P0).
+
+### Request JSON
+
+```json
+{
+  "lang": "ru",
+  "raw_brief": "string",
+  "tenant_brand": {
+    "template_id": "string",
+    "brand_lock_level": "strict|medium|low",
+    "palette": {"primary":"#","secondary":"#","accent":"#","bg":"#","text":"#"},
+    "fonts": {"primary":"string","secondary":"string"}
+  },
+  "sources_manifest": [
+    {"source_ref":"s1","type":"text|table|link","title":"string","content":"string","uri":null}
+  ]
+}
+```
+
+### Response JSON (200)
+
+```json
+{
+  "brief_v1": {
+    "brief": {
+      "topic": "string",
+      "goal": "string",
+      "audience": {"who":"string","level":"string","pain_points":["string"]},
+      "context": "string",
+      "key_messages": ["string"],
+      "call_to_action": "string",
+      "constraints": {
+        "slide_count": 10,
+        "time_minutes": 5,
+        "language": "ru",
+        "tone": "string",
+        "must_include": ["string"],
+        "must_avoid": ["string"]
+      },
+      "brand": {"template_id":"string","brand_lock_level":"strict"},
+      "data_inputs": [{"type":"text|table|link|none","description":"string","ref":"s1"}],
+      "assumptions": ["assumed: ..."]
+    },
+    "missing_info": ["string"],
+    "clarifying_questions": ["string"],
+    "risks": ["string"]
+  }
+}
+```
+
+### Идемпотентность
+
+* **Рекомендуется** принимать `Idempotency-Key`.
+* Если одинаковые `raw_brief + tenant_brand + sources_manifest` и одинаковый ключ — вернуть тот же `brief_v1`.
+
+### Ошибки
+
+* `400 INVALID_REQUEST`, `413 PAYLOAD_TOO_LARGE`, `401/403`, `429`, `503 LLM_UNAVAILABLE`
+
+---
+
+## 2) POST `/deck/generate` (P0–P7)
+
+Запускает генерацию deck по пайплайну (normalize → storyline → blueprint → copy → QA → render_spec).
+
+### Request JSON
+
+```json
+{
+  "lang": "ru",
+  "input": {
+    "raw_brief": "string",
+    "brief_v1": null,
+    "clarifier_answers": {},
+    "sources_manifest": [
+      {"source_ref":"s1","type":"text|table|link","title":"string","content":"string","uri":null}
+    ]
+  },
+  "generation_config": {
+    "mode": "student|teacher|admin",
+    "strict_sources_only": true,
+    "max_slide_count": 15,
+    "target_time_minutes": 5
+  },
+  "tenant_brand": {
+    "template_id": "string",
+    "brand_lock_level": "strict|medium|low"
+  }
+}
+```
+
+**Примечание:** можно передать либо `raw_brief`, либо уже подготовленный `brief_v1` (например после `/brief/normalize`).
+
+### Response JSON (202 Accepted)
+
+Асинхронный запуск (рекомендовано, т.к. есть SLO и очереди).
+
+```json
+{
+  "deck_id": "deck_123",
+  "run_id": "run_456",
+  "status": "queued|running",
+  "poll": {
+    "deck_url": "/api/v1/deck/deck_123",
+    "recommended_interval_ms": 1500
+  }
+}
+```
+
+### (Опционально) Response JSON (200 Sync mode)
+
+Если делаете синхронно для MVP демо:
+
+```json
+{
+  "deck_id": "deck_123",
+  "run_id": "run_456",
+  "status": "completed",
+  "deck": {
+    "version_id": "v1",
+    "slides": [{"slide_no":1,"title":"...","bullets":["..."],"speaker_notes":"..."}],
+    "qa_report": {"score_total": 16, "high_severity": 0},
+    "render_spec_ref": "s3://.../render_spec.json"
+  }
+}
+```
+
+### Идемпотентность / ретраи
+
+* **Обязательно**: `Idempotency-Key` для генерации.
+* Семантика:
+
+  * повтор с тем же ключом → вернуть тот же `deck_id/run_id/status`.
+  * TTL ключа: 24 часа (настраиваемо).
+* Ретраи клиентом: только при `429/503/504`.
+
+### Ошибки
+
+* `400 INVALID_REQUEST` (например, `max_slide_count>15`)
+* `403 FORBIDDEN` (роль/тенант)
+* `409 CONFLICT` (например, запрет генерации без утверждённого шаблона при strict brand)
+* `422 SCHEMA_VALIDATION_FAILED` (LLM выдал невалидный JSON)
+* `503 LLM_UNAVAILABLE`, `429 RATE_LIMITED`
+
+---
+
+## 3) POST `/deck/{id}/edit` (P8 — partial regen)
+
+Точечная правка: перегенерация **одного слайда/блока** с минимальным контекстом и возвратом patch + новой версии.
+
+### Request JSON
+
+```json
+{
+  "base_version_id": "v1",
+  "operation": "rewrite_slide|add_slide|delete_slide|change_visual",
+  "target": {
+    "slide_no": 5,
+    "block": "title|bullets|speaker_notes|visual|all"
+  },
+  "instruction": "Сократи буллеты, сделай проще, добавь 1 пример (без новых фактов).",
+  "constraints": {
+    "max_bullets": 5,
+    "max_words_per_bullet": 12
+  }
+}
+```
+
+### Response JSON (200)
+
+```json
+{
+  "deck_id": "deck_123",
+  "old_version_id": "v1",
+  "new_version_id": "v2",
+  "patch": {
+    "slide_no": 5,
+    "title": null,
+    "bullets_replace": ["...","...","..."],
+    "speaker_notes": null,
+    "visual_patch": null
+  },
+  "diff_summary": "Буллеты укорочены, терминология унифицирована.",
+  "qa_patch": {
+    "issues": [{"severity":"low","problem":"...","fix_suggestion":"..."}],
+    "score_delta": 1
+  }
+}
+```
+
+### Идемпотентность / ретраи
+
+* `Idempotency-Key` **рекомендуется** (особенно для UI повторов).
+* Защита от гонок: `base_version_id` обязателен.
+
+  * Если версия устарела → `409 CONFLICT` (см. ошибки).
+
+### Ошибки
+
+* `404 NOT_FOUND` (deck)
+* `409 CONFLICT` — `base_version_id` не совпал с текущей версией
+* `403 FORBIDDEN` — нет прав править этот deck
+* `422 SCHEMA_VALIDATION_FAILED` — невалидный patch от LLM
+* `400 INVALID_REQUEST` — запрет редактирования brand-locked свойств (если пытаются)
+* `503 LLM_UNAVAILABLE`, `429 RATE_LIMITED`
+
+---
+
+## 4) GET `/deck/{id}`
+
+Возвращает deck, статусы генерации/экспорта, версии и ссылки на артефакты.
+
+### Query params
+
+* `version_id` (optional) — получить конкретную версию
+* `include=slides|qa|render_spec|exports` (optional; по умолчанию `slides,qa,exports`)
+
+### Response JSON (200)
+
+```json
+{
+  "deck": {
+    "deck_id": "deck_123",
+    "tenant_id": "t1",
+    "owner_user_id": "u1",
+    "current_version_id": "v2",
+    "status": "draft|ready|exporting|failed",
+    "meta": {
+      "lang": "ru",
+      "template_id": "tpl_01",
+      "brand_lock_level": "strict",
+      "created_at": "2026-02-28T10:00:00Z",
+      "updated_at": "2026-02-28T10:05:00Z"
+    },
+    "slides": [
+      {"slide_no":1,"title":"...","bullets":["..."],"speaker_notes":"..."}
+    ],
+    "qa_report": {
+      "score_total": 16,
+      "issues": [{"severity":"medium","slide_no":3,"problem":"..."}],
+      "needs_user_input": []
+    },
+    "render_spec": {"ref":"s3://.../render_spec.json"},
+    "exports": [
+      {"export_id":"e1","format":"pptx","status":"completed","download_url":"https://...","expires_at":"..."}
+    ]
+  }
+}
+```
+
+### Ошибки
+
+* `404 NOT_FOUND`
+* `403 FORBIDDEN`
+
+### Лимиты
+
+* Если `include=render_spec` — может быть большой JSON: сервер может отдавать только `ref`, а полный spec — отдельной ссылкой.
+
+---
+
+## 5) POST `/deck/{id}/export`
+
+Создаёт ExportJob и запускает Renderer (PPTX/PDF). Идемпотентность по `(deck_version_id, format)` — повторный экспорт должен возвращать уже готовый файл (кэш).
+
+### Request JSON
+
+```json
+{
+  "version_id": "v2",
+  "format": "pptx|pdf",
+  "options": {
+    "include_speaker_notes": true,
+    "compress_images": true
+  }
+}
+```
+
+### Response JSON (202)
+
+```json
+{
+  "export_id": "exp_789",
+  "deck_id": "deck_123",
+  "version_id": "v2",
+  "format": "pptx",
+  "status": "queued|running",
+  "poll": {
+    "deck_url": "/api/v1/deck/deck_123",
+    "recommended_interval_ms": 1500
+  }
+}
+```
+
+### Response JSON (200) — если файл уже есть (кэш)
+
+```json
+{
+  "export_id": "exp_789",
+  "status": "completed",
+  "download_url": "https://signed-url",
+  "expires_at": "2026-02-28T10:30:00Z"
+}
+```
+
+### Идемпотентность / ретраи
+
+* `Idempotency-Key` **обязательно** (чтобы не создать дубликаты ExportJob).
+* Кэш-идемпотентность:
+
+  * если существует успешный export для `(deck_id, version_id, format, options_hash)` → вернуть его.
+
+### Ошибки
+
+* `409 CONFLICT` — экспорт запрещён, если `qa_report.high_severity > 0` (если включён quality gate) 
+* `503 RENDERER_UNAVAILABLE`
+* `504 TIMEOUT` (если синхронный режим)
+* `422` если `render_spec` отсутствует/невалиден
+
+### Лимиты
+
+* Export rate limit: **10 exports/min/user**
+* Максимум слайдов: **15** (MVP), иначе `400 INVALID_REQUEST`. 
+
+---
+
+## 6) Примечания по реализации (MVP-важно)
+
+### Хранение артефактов пайплайна
+
+В `GenerationRun` (DB) сохранять:
+
+* `promptset_version`, `prompt_versions[]`, `model_ids[]`
+* `input_hash`
+* refs на `brief_v1/storyline/blueprint/slides/qa/render_spec` в S3
+  Это нужно для воспроизводимости и аудита.
+
+### Audit log (события)
+
+События писать при:
+
+* `generate_start/finish`, `edit`, `export_start/finish`, `template_update`, `role_change`.
+
+---
+
+Если хочешь, в следующем сообщении разверну это в **OpenAPI-подобную структуру** (без YAML-генерации), и добавлю **JSON Schema** для request/response каждого эндпоинта (как для backend-валидации).
