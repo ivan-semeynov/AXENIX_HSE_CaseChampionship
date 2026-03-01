@@ -1,0 +1,441 @@
+Роль: Prompt Engineer Lead.
+
+Опиши prompt-архитектуру как часть системного дизайна:
+- Pipeline шагов P0–P8 (название, вход, выход, техника prompting)
+- Структуры JSON для каждого шага
+- Guardrails (anti-hallucination, style locks, length limits)
+- Human-in-the-loop точки
+- Как делать частичную регенерацию (per slide)
+- Как оценивать качество автоматически (rubric)
+
+Верни Markdown + таблицу "Prompt steps".
+Architecture:
+<<<{# Архитектура сервиса: AI-генерация презентаций для российских вузов (B2B2C)
+
+Ниже — целевая архитектура MVP, ориентированная на: **SSO**, **brand-lock**, **частичную регенерацию**, **экспорт PPTX/PDF**, **дашборды/аудит**, **локальный комплаенс (ПДн)**.
+
+---
+
+## 1) C4 L1 — Context (контекстная диаграмма)
+
+**Акторы**
+
+* **Student / Teacher** — создают, правят и экспортируют презентации.
+* **Admin (ВУЗ)** — управляет шаблонами/брендбуком, ролями, отчётами.
+* **Buyer** — просматривает демо/документы для закупки (может быть Admin).
+* **University SSO/IdP** — аутентификация (SAML/OIDC).
+* **LLM Provider(s)** — модели (через LLM Gateway).
+* **Object Storage / File system** — хранение исходников/экспортов.
+* **Monitoring/Logging stack** — метрики, трассировка, аудит.
+
+### ASCII: C4 L1 (Context)
+
+```
++-------------------+        +-------------------------+
+| Student / Teacher |<------>|  Web App (UI)           |
++-------------------+        +-----------+-------------+
+                                        |
+                                        v
++-------------------+        +-------------------------+
+| Admin / Buyer     |<------>|  API / Orchestrator     |
++-------------------+        +-----+---------+---------+
+                                  |         |
+                                  |         v
+                                  |   +-----+--------+
+                                  |   | LLM Gateway   |<----> LLM Provider(s)
+                                  |   +--------------+
+                                  |
+                                  v
+                         +--------+---------+
+                         | Storage (DB+S3)  |
+                         +--------+---------+
+                                  |
+                                  v
+                         +--------+---------+
+                         | Renderer (PPTX)  |
+                         +--------+---------+
+                                  |
+                                  v
+                           Export (PPTX/PDF)
+
+University SSO/IdP <----> UI/Orchestrator (auth)
+Observability stack <---- all services (metrics/logs/traces/audit)
+```
+
+---
+
+## 2) C4 L2 — Containers (контейнеры)
+
+### 2.1 Web App (UI)
+
+**Ответственность:**
+
+* Авторизация (SSO), работа с brief, редактор слайдов (brand-locked controls), запуск генерации/правок/экспорта, просмотр статусов.
+* Для Admin: загрузка брендбука/шаблонов, управление орг-структурой, дашборды.
+
+**Ключевые функции:**
+
+* Draft workspace (deck editor)
+* Progress UI (generation/export)
+* Admin console (templates, roles, dashboards)
+
+---
+
+### 2.2 Orchestrator API (Backend)
+
+**Ответственность:**
+
+* Управление жизненным циклом Deck / Generation Run / Export Job
+* Оркестрация пайплайна (normalize → outline → copy → QA → renderSpec)
+* Частичная регенерация (per-slide / per-block)
+* Политики: brand-lock, лимиты, идемпотентность, ретраи
+* API для UI + интеграция с SSO
+
+**Ключевые модули:**
+
+* **Auth/RBAC module** (roles/org units)
+* **Deck service** (CRUD, versions)
+* **Generation service** (runs, steps, caches)
+* **Export service** (jobs, files)
+* **Admin service** (templates, brand tokens)
+* **Metrics/Audit service** (events, reporting)
+
+---
+
+### 2.3 LLM Gateway
+
+**Ответственность:** единая точка вызова LLM:
+
+* маршрутизация по моделям (cheap → strong), fallback
+* лимиты токенов/стоимости, кэширование
+* “structured output” в JSON schema, валидация
+* redaction/PII-маскирование в логах
+* retry/backoff на временные ошибки
+
+---
+
+### 2.4 Storage (DB + Object Storage)
+
+**DB (PostgreSQL):**
+
+* Tenants, Users, Roles, OrgUnits
+* Decks, Slides, Versions
+* GenerationRuns, StepResults (ссылки на артефакты)
+* Exports, ExportJobs
+* AuditEvents, MetricsAgg (агрегаты)
+
+**Object storage (S3-совместимое / MinIO):**
+
+* загруженные источники (docs/text)
+* шаблоны/бренд-ассеты (pptx template, logos, fonts*)
+* экспортированные pptx/pdf
+* промежуточные артефакты пайплайна (json specs)
+
+* *шрифты — при условии наличия лицензии и политики вуза.*
+
+---
+
+### 2.5 Renderer (PPTX/PDF)
+
+**Ответственность:** сборка финального файла по `render_spec`:
+
+* применение шаблонов/макетов
+* размещение текстов/визуалов
+* генерация PPTX и/или PDF
+
+Вариант реализации:
+
+* отдельный сервис (stateless workers) + очередь задач.
+
+---
+
+### 2.6 Asset Service (визуалы)
+
+**Ответственность:** подготовка “визуальных ассетов”:
+
+* генерация/подбор иконок
+* преобразование таблиц в графики (если есть данные)
+* безопасная обработка изображений (resize, compress)
+* хранение и выдача ассетов по ссылке
+
+Для MVP можно ограничиться:
+
+* иконки (каталог/поиск) + placeholders,
+* графики только из явно переданных таблиц.
+
+---
+
+### 2.7 Observability (Logs/Metrics/Traces + Audit)
+
+**Ответственность:**
+
+* технические метрики (latency, errors, cost)
+* трассировка шагов пайплайна
+* audit log (неизменяемые события)
+* продуктовые метрики (BPC, activation, exports, time-to-first-deck)
+
+---
+
+### ASCII: C4 L2 (Containers)
+
+```
++---------------------------+
+|        Web App (UI)       |
+|  - Brief/Deck editor      |
+|  - Admin console          |
+|  - Progress UI            |
++-------------+-------------+
+              |
+              v
++---------------------------+      +------------------+
+|     Orchestrator API      |<---->| University SSO   |
+|  - Auth/RBAC              |      | (SAML/OIDC IdP)  |
+|  - Deck/Run/Export         |      +------------------+
+|  - Policies (brand-lock)  |
++------+------+------+------+
+       |      |      |
+       |      |      v
+       |      |   +------------------+
+       |      |   | Renderer Service |
+       |      |   | (PPTX/PDF)       |
+       |      |   +------------------+
+       |      |
+       |      v
+       |   +------------------+        +------------------+
+       |   |   LLM Gateway     |<------>| LLM Provider(s)  |
+       |   | (routing/cost/    |        +------------------+
+       |   |  schema/PII)      |
+       |   +------------------+
+       |
+       v
++---------------------------+        +------------------+
+| Storage                   |<------>| Asset Service    |
+| - Postgres (entities)     |        | (icons/charts)   |
+| - Object storage (S3)     |        +------------------+
++-------------+-------------+
+              |
+              v
++---------------------------+
+| Observability             |
+| - Logs/Metrics/Traces     |
+| - Audit log               |
++---------------------------+
+```
+
+---
+
+## 3) Основные sequence flows
+
+### 3.1 Flow A — Generate (создание презентации)
+
+**Цель:** brief + sources → deck draft + render_spec → (опционально) автосохранение черновика.
+
+```
+User(UI)        Orchestrator        Storage        LLM Gateway        Renderer
+  |                 |                 |                |               |
+  | POST /deck/generate (brief+src)   |                |               |
+  |---------------->|                 |                |               |
+  |                 | create Deck, Run|                |               |
+  |                 |-----> DB        |                |               |
+  |                 | upload sources->| (S3)           |               |
+  |                 |                 |                |               |
+  |                 | Step P0 normalize -------------->|               |
+  |                 |<---------------------------------|               |
+  |                 | Step P2 storyline -------------->|               |
+  |                 |<---------------------------------|               |
+  |                 | Step P3 blueprint -------------->|               |
+  |                 |<---------------------------------|               |
+  |                 | Step P4 copy+notes ------------->|               |
+  |                 |<---------------------------------|               |
+  |                 | Step P6 QA/fix ----------------->|               |
+  |                 |<---------------------------------|               |
+  |                 | Step P7 render_spec ------------>|               |
+  |                 |<---------------------------------|               |
+  |                 | store slides/spec -> DB/S3        |               |
+  |                 | return deck_id + status           |               |
+  |<----------------|                                   |               |
+  | poll GET /deck/{id}/status                          |               |
+```
+
+**Принцип антигаллюцинаций:** LLM Gateway/Orchestrator запрещает ввод “новых фактов”: если факт/цифра не из Source — пометка `NEEDS_SOURCE` и/или вопрос пользователю.
+
+---
+
+### 3.2 Flow B — Edit (частичная регенерация)
+
+**Цель:** правка одного слайда/блока без пересборки всего deck.
+
+```
+User(UI)        Orchestrator        Storage        LLM Gateway
+  |                 |                 |                |
+  | POST /deck/{id}/edit (slide=5, instruction)        |
+  |---------------->| load slide+context -> DB/S3       |
+  |                 |--------------->|                  |
+  |                 | Step "targeted_rewrite" --------->|
+  |                 |<----------------------------------|
+  |                 | validate brand-lock, length, QA    |
+  |                 | store new slide version -> DB      |
+  |<----------------| return updated slide + version_id  |
+```
+
+**Ключевой момент:** Orchestrator формирует *минимальный контекст*: цель, аудитория, термины, соседние слайды, brand tokens — чтобы снизить стоимость и риск “уплывания” стиля.
+
+---
+
+### 3.3 Flow C — Export (PPTX/PDF)
+
+**Цель:** собрать файл на основе `render_spec`, с шаблоном вуза.
+
+```
+User(UI)        Orchestrator        Storage          Renderer
+  |                 |                 |                |
+  | POST /deck/{id}/export (format=PPTX)               |
+  |---------------->| create ExportJob -> DB            |
+  |                 | enqueue job                       |
+  |                 |------------------------------->   |
+  |                 |                 |  fetch spec+tpl  |
+  |                 |                 |<-----------------|
+  |                 |                 |  render PPTX      |
+  |                 |                 |----------------->|
+  |                 |                 |  store file -> S3 |
+  |                 |                 |<-----------------|
+  |<----------------| return download_url / status       |
+```
+
+**Идемпотентность:** если deck_version не менялась — повторный export возвращает существующий файл (кэш).
+
+---
+
+## 4) Выбор технологий (варианты + почему)
+
+Ниже — варианты, которые удобно защищать на хакатоне: “можно так, можно так, выбираем X для MVP”.
+
+### 4.1 UI
+
+* **React/Next.js** (вариант): быстро, богатая экосистема, удобен редактор, SSR необязателен.
+* Альтернатива: **Vue/Nuxt** — аналогично.
+
+**Почему:** нужен быстрый UX, редактор, прогресс, админка.
+
+### 4.2 Orchestrator API
+
+* **Python (FastAPI)**: удобно для LLM-оркестрации, схем/валидации, интеграций, быстрый MVP.
+* Альтернатива: **Node.js (NestJS)**: если команда сильнее в TS и рендер в JS.
+
+**Почему:** много JSON, схем, очереди, интеграции, аудит.
+
+### 4.3 Queue / async jobs (рендер/генерация)
+
+* **Redis + RQ/Celery** (Python) или **BullMQ** (Node).
+* Альтернатива: **Kafka/RabbitMQ** (тяжелее для MVP).
+
+**Почему:** экспорт/рендер и часть пайплайна лучше выполнять асинхронно.
+
+### 4.4 Storage
+
+* **PostgreSQL** для сущностей/версий/аудита (ACID).
+* **S3-compatible** (MinIO) для файлов/шаблонов/экспортов.
+
+**Почему:** понятный стандарт для multi-tenant и файлов.
+
+### 4.5 Renderer
+
+* **PptxGenJS** (Node service) — удобно генерировать PPTX программно.
+* Альтернатива: **python-pptx** (Python) — но часто сложнее с layout’ами и шрифтами.
+
+**Почему:** контролируемая верстка, предсказуемый экспорт.
+
+### 4.6 LLM Gateway
+
+* Собственный сервис (тонкий): routing + validation + redaction.
+* Внутри: JSON schema validation (pydantic/zod), cost limits, caching.
+
+**Почему:** единое место политики качества, безопасности и стоимости.
+
+### 4.7 Observability
+
+* MVP: **Prometheus + Grafana** (метрики), **Loki/ELK** (логи), **OpenTelemetry** (traces).
+* Аудит: в Postgres + (опционально) write-once storage.
+
+**Почему:** жюри любит измеримость и воспроизводимость.
+
+---
+
+## 5) Где хранятся промпты и как версионируются
+
+### 5.1 Хранилище промптов (Prompt Library)
+
+**Рекомендуемый подход (MVP):**
+
+* промпты хранятся как **файлы в репозитории** (`/prompts/P0_normalize.md`, …) + метаданные (id, version, schema).
+* в проде Orchestrator загружает их как конфиг-артефакты (или через feature-flag конфиг).
+
+**Почему:** прозрачность, code review, быстрые изменения.
+
+### 5.2 Версионирование
+
+* **SemVer** на уровне набора промптов: `promptset_version = 1.3.0`
+* Для каждого шага: `prompt_id + prompt_version` (например `P3@1.2`)
+* Все `GenerationRun` сохраняют:
+
+  * `promptset_version`
+  * `prompt_version_per_step`
+  * `model_id_per_step`
+  * `input_hash` (для воспроизводимости)
+  * `output_artifacts_ref` (S3)
+
+### 5.3 Контроль качества промптов
+
+* обязательная **JSON schema validation** на выходе каждого шага
+* “canary runs” на тест-брифах при изменении promptset
+
+---
+
+## 6) Безопасность (PII, секреты, RBAC, audit log)
+
+### 6.1 PII/ПДн
+
+* **Минимизация:** хранить минимум атрибутов пользователя (id, роль, org_unit).
+* **Redaction:** любые логи шагов LLM должны маскировать ПДн (email/телефон/паспорт и т.п.).
+* **Data retention:** сроки хранения брифов/источников/логов настраиваются per-tenant.
+
+### 6.2 Секреты
+
+* ключи LLM и другие токены хранятся в **Secrets Manager** (Vault/KMS/аналог)
+* запрещено логировать secrets; доступ — только у сервисных аккаунтов
+
+### 6.3 RBAC
+
+* базовые роли: Student, Teacher, Admin, Buyer
+* разграничение по org units:
+
+  * Student/Teacher — видят свои deck’и (и возможно общие кафедральные шаблоны)
+  * Admin — управляет шаблонами и видит дашборды по своему тенанту
+  * Buyer — read-only доступ к демо/документам
+
+### 6.4 Audit log
+
+События (write-only):
+
+* login, generate_start/finish, edit, export, template_update, role_change
+* атрибуты: timestamp, user_id, role, tenant_id, org_unit, object_id (deck/export), result, error_code
+
+**Неподменяемость (MVP):**
+
+* хранить в Postgres + периодическая выгрузка в “append-only” storage (S3 bucket с write-once policy) или отдельную таблицу без UPDATE прав.
+
+---
+
+## 7) Комментарии по масштабированию (MVP → growth)
+
+* Renderer и LLM-пайплайн — выносятся в воркеры и масштабируются горизонтально.
+* LLM Gateway позволяет контролировать стоимость и качество централизованно.
+* Multi-tenant изоляция обеспечивается tenant_id на всех сущностях + отдельные buckets/prefixes в S3.
+
+---
+
+Если нужно, могу следующим сообщением добавить:
+
+1. **черновую ER-схему (ASCII)** для ключевых таблиц,
+2. **черновой REST API** (request/response) под `/deck/generate`, `/deck/{id}/edit`, `/deck/{id}/export`.
+}>>>
