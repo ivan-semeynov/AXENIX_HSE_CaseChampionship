@@ -69,7 +69,7 @@
 - **Asset Service**: иконки/графики (из таблиц).
 - **Observability**: метрики/логи/трейсы + audit.
 
-### Диаграмма (контейнеры)
+### Диаграммы
 
 
 Подробно: `System_Architecture_AXENIX.pdf`
